@@ -6,10 +6,12 @@ Only one voice plays at a time, even with several sessions open: a new reply cut
 
 ## Requirements
 
-- **macOS.** That is the only OS it has been tested on. Playback uses ffmpeg's `audiotoolbox` output, which is macOS only, so it will not play on Linux or Windows as written.
-- **ffmpeg**: `brew install ffmpeg`
+- **macOS or Linux.** On macOS it plays through ffmpeg's `audiotoolbox` output. On Linux it plays through PulseAudio (which PipeWire also serves, as on current Ubuntu and Fedora desktops) when a sound server is running, and through ALSA's default device otherwise. Windows is not supported.
+- **ffmpeg**: `brew install ffmpeg` on macOS, `sudo apt install ffmpeg` (or your distro's package) on Linux. On Linux it needs the `pulse` or `alsa` output, which distro builds include; `ffmpeg -hide_banner -devices` lists them.
 - **A Fish Audio account and API key.** Get a key at <https://fish.audio/app/api-keys/>.
-- **Claude Code** with a build that loads hooks modules. Tested on 2.1.309.
+- **Claude Code** with a build that loads hooks modules. Tested on 2.1.309 (macOS) and 2.1.331 (Linux).
+
+On Linux, `/speak key` opens the key file with `xdg-open`; if that is missing, open the path it prints in any editor.
 
 ## Install
 
@@ -51,4 +53,4 @@ Every spoken reply uses Fish Audio credits, and because it is on by default that
 
 ## Status
 
-Tested on macOS with scripted Claude Code sessions. Not yet confirmed by hand in the desktop app's Code tab, and sessions the app starts in the background may behave differently there.
+Tested on macOS with scripted Claude Code sessions. The Linux path is covered by the unit tests and by playing the real pipeline into a PulseAudio sink; it has not yet been tried by ear on a Linux desktop. Not yet confirmed by hand in the desktop app's Code tab, and sessions the app starts in the background may behave differently there.

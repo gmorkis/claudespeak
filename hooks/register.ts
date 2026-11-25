@@ -30,14 +30,15 @@ const TAG_PREFIX = 'claudespeak-'
 export const ANY_SPEECH = `^(${CURL}|[^ ]*/ffmpeg) .*${TAG_PREFIX}[0-9]+`
 
 // One pipeline, so nothing waits for the whole clip: Fish's raw PCM goes straight into
-// the default output. $6 tags curl and ffmpeg so they can be found again.
+// the default output (${10} and ${11}: ffmpeg's output device and its target, from
+// audioOutput). $6 tags curl and ffmpeg so they can be found again.
 // One voice at a time, with no lock to go stale: claim the file, kill every other player,
 // start, and give way if a newer speaker claimed it while this one was starting.
 const STREAM_SCRIPT =
   'exec 3<&0; printf %s "$6" > "$7"; "$8" -KILL -f "$9"; [ "$(cat "$7")" = "$6" ] || exit 0; ' +
   '"$1" -sSfN --max-time 60 -H @- -A "$6" -H "Content-Type: application/json" -H "model: $4" --data-binary "@$5" "$3" <&3 | ' +
   '"$2" -nostdin -hide_banner -loglevel error -fflags nobuffer -probesize 32 -analyzeduration 0 ' +
-  `-f s16le -ar ${SAMPLE_RATE} -ac 1 -i pipe:0 -af silenceremove=start_periods=1:start_threshold=-50dB -metadata title="$6" -f audiotoolbox - & ` +
+  `-f s16le -ar ${SAMPLE_RATE} -ac 1 -i pipe:0 -af silenceremove=start_periods=1:start_threshold=-50dB -metadata title="$6" -f "\${10}" "\${11}" & ` +
   'P=$!; sleep 0.1; [ "$(cat "$7")" = "$6" ] || "$8" -KILL -f "$6"; wait $P'
 
 export type VoiceConfig = {
@@ -280,6 +281,37 @@ async function findFfmpeg($: $): Promise<string | undefined> {
   return found === '' ? undefined : found
 }
 
+export type AudioOutput = { device: string; target: string }
+
+/**
+ * Where ffmpeg plays to. macOS: audiotoolbox. Linux: PulseAudio, which PipeWire
+ * also serves, when its socket is there and this ffmpeg has the output; else ALSA.
+ */
+export const pickAudioOutput = (sysname: string, devices: string, hasPulse: boolean): AudioOutput =>
+  sysname === 'Darwin'
+    ? { device: 'audiotoolbox', target: '-' }
+    : hasPulse && /^\s*D\S*\s+pulse\b/m.test(devices)
+      ? { device: 'pulse', target: 'claudespeak' }
+      : { device: 'alsa', target: 'default' }
+
+async function sysname($: $): Promise<string> {
+  const machine = await $.session.machine().catch(() => undefined)
+  if (machine?.sysname) return machine.sysname
+  const uname = await $.process.run(['/usr/bin/env', 'uname', '-s']).catch(() => undefined)
+  return uname?.exitCode === 0 ? uname.stdout.trim() : ''
+}
+
+async function audioOutput($: $, ffmpeg: string): Promise<AudioOutput> {
+  const system = await sysname($)
+  if (system === 'Darwin') return pickAudioOutput(system, '', false)
+  const listed = await $.process.run([ffmpeg, '-hide_banner', '-devices']).catch(() => undefined)
+  const runtime = (await $.env.get('XDG_RUNTIME_DIR')) ?? ''
+  const hasPulse =
+    ((await $.env.get('PULSE_SERVER')) ?? '') !== '' ||
+    (runtime !== '' && (await $.fs.exists(`${runtime}/pulse/native`).catch(() => false)))
+  return pickAudioOutput(system, listed?.stdout ?? '', hasPulse)
+}
+
 async function summarize($: $, answer: string): Promise<string> {
   if (isSpeakable(answer)) return cleanSpoken(answer)
   const ask = (model: string) =>
@@ -298,6 +330,7 @@ async function summarize($: $, answer: string): Promise<string> {
 
 /** Plays while Fish generates. Resolves when the clip ends or something cuts it. */
 async function streamSpeech($: $, key: string, ffmpeg: string, text: string): Promise<void> {
+  const out = await audioOutput($, ffmpeg)
   const tag = `${TAG_PREFIX}${await $.clock.now()}`
   const bodyPath = `${await tmpDir($)}/${tag}.json`
   await $.fs.write(bodyPath, ttsBody(text, cfg.voiceId))
@@ -308,7 +341,7 @@ async function streamSpeech($: $, key: string, ffmpeg: string, text: string): Pr
       [
         '/bin/sh', '-c', STREAM_SCRIPT, 'voice',
         CURL, ffmpeg, `${FISH}/v1/tts`, cfg.ttsModel, bodyPath, tag,
-        await dataPath($, CURRENT_FILE), PKILL, ANY_SPEECH,
+        await dataPath($, CURRENT_FILE), PKILL, ANY_SPEECH, out.device, out.target,
       ],
       { stdin: `Authorization: Bearer ${key}\n`, timeoutMs: 180_000 },
     )
@@ -336,7 +369,8 @@ async function speak($: $, answer: string): Promise<void> {
   if (current.startsWith('stopped ') && Number(current.slice(8)) > startedAt) return
   const ffmpeg = await findFfmpeg($)
   if (ffmpeg === undefined) {
-    $.ui.toast('ffmpeg not found: brew install ffmpeg', { timeoutMs: 8000 })
+    const hint = (await sysname($)) === 'Darwin' ? 'brew install ffmpeg' : 'install it with your package manager, e.g. sudo apt install ffmpeg'
+    $.ui.toast(`ffmpeg not found: ${hint}`, { timeoutMs: 8000 })
     return
   }
   await streamSpeech($, key, ffmpeg, line)

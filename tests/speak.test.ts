@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, ProcessRunResult } from 'claude-code'
 
-import { ANY_SPEECH, cleanSpoken, isSpeakable, parseEnvKey, parseSetting, SPEECH_SPEED } from '../hooks/register'
+import { ANY_SPEECH, cleanSpoken, isSpeakable, parseEnvKey, parseSetting, pickAudioOutput, SPEECH_SPEED } from '../hooks/register'
 
 const SAWYER = 'fa4c9eb3dccc4806b382b40d61c6b10a'
 const KEY = 'test-fish-key'
@@ -35,7 +35,7 @@ const ran = (stdout: string, exitCode = 0, stderr = ''): ProcessRunResult => ({
 /** Everything beneath the plugin, answered from memory: no speaker, no network, no credits. */
 const world = (
   on: On,
-  opts: { envText?: string; hasFfmpeg?: boolean; stderr?: string; summary?: string; env?: Record<string, string>; setting?: string; current?: string } = {},
+  opts: { envText?: string; hasFfmpeg?: boolean; stderr?: string; summary?: string; env?: Record<string, string>; setting?: string; current?: string; exists?: string[]; devices?: string } = {},
 ): World => {
   mock.clock(on, { now: 1_000 })
   mock.store(on)
@@ -75,6 +75,7 @@ const world = (
       (opts.hasFfmpeg !== false && e.path === '/opt/homebrew/bin/ffmpeg') ||
       e.path === '/usr/bin/open' ||
       files.has(e.path) ||
+      (opts.exists ?? []).includes(e.path) ||
       (e.path === ENV_FILE && opts.envText !== undefined),
   }))
   on('fs.write', ($, e) => {
@@ -102,6 +103,7 @@ const world = (
       return { value: ran('') }
     }
     if (bin === '/usr/bin/which') return { value: ran('', 1) }
+    if (e.argv[2] === '-devices') return { value: ran(opts.devices ?? '') }
     return { value: ran('') }
   })
   on('model.complete', ($, e) => {
@@ -314,7 +316,7 @@ describe('spoken replies', () => {
     await w.started
     const stopped = await $.command.run(cmd('speak', 'stop'))
     expect(stopped.text).toBe('Stopped speaking.')
-    const tag = w.runs.find(run => run.includes('https://api.fish.audio/v1/tts'))?.at(-1) ?? ''
+    const tag = w.runs.find(run => run.includes('https://api.fish.audio/v1/tts'))?.at(-3) ?? ''
     expect(tag === ANY_SPEECH).toBe(true)
     expect(w.runs).toContainEqual(['/usr/bin/pkill', '-KILL', '-f', ANY_SPEECH])
     w.endStream()
@@ -389,7 +391,7 @@ describe('spoken replies', () => {
     await w.started
     const run = w.runs.find(r => r.includes('https://api.fish.audio/v1/tts')) ?? []
     expect(run).toContain(`${DATA}/current-speech`)
-    expect(run.at(-1)).toBe(ANY_SPEECH)
+    expect(run.at(-3)).toBe(ANY_SPEECH)
     expect(run[2]).toContain('-KILL -f')
     w.endStream()
   })
@@ -438,5 +440,56 @@ describe('spoken replies', () => {
     expect(parseSetting('not json')).toBe(true)
     expect(parseSetting('{"isOn":true}')).toBe(true)
     expect(parseSetting('{"isOn":false}')).toBe(false)
+  })
+})
+
+describe('audio output', () => {
+  const PULSE = ' DE alsa            ALSA audio output\n DE pulse           Pulse audio output\n'
+
+  test('macOS plays to audiotoolbox; Linux to pulse when it can, else ALSA', async () => {
+    expect(pickAudioOutput('Darwin', '', false)).toEqual({ device: 'audiotoolbox', target: '-' })
+    expect(pickAudioOutput('Linux', PULSE, true)).toEqual({ device: 'pulse', target: 'claudespeak' })
+    expect(pickAudioOutput('Linux', PULSE, false)).toEqual({ device: 'alsa', target: 'default' })
+    expect(pickAudioOutput('Linux', ' DE alsa  ALSA audio output\n', true)).toEqual({ device: 'alsa', target: 'default' })
+  })
+
+  const machine = (sysname: string) => ({
+    value: { sysname, release: '1', machine: 'x86_64', packageManagers: [], runtimes: [] },
+  })
+  const tail = (w: World) => (w.runs.find(run => run.includes('https://api.fish.audio/v1/tts')) ?? []).slice(-2)
+
+  test('on macOS the stream plays to audiotoolbox', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.machine', () => machine('Darwin'))
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(tail(w)).toEqual(['audiotoolbox', '-'])
+    w.endStream()
+  })
+
+  test('on Linux with a PulseAudio or PipeWire socket the stream plays to pulse', async ($, on) => {
+    const w = world(on, {
+      envText: `FISH_API_KEY=${KEY}`,
+      env: { XDG_RUNTIME_DIR: '/run/user/1000' },
+      exists: ['/run/user/1000/pulse/native'],
+      devices: PULSE,
+    })
+    on('session.machine', () => machine('Linux'))
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(tail(w)).toEqual(['pulse', 'claudespeak'])
+    w.endStream()
+  })
+
+  test('on Linux with no sound server the stream plays to ALSA', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, devices: PULSE })
+    on('session.machine', () => machine('Linux'))
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(tail(w)).toEqual(['alsa', 'default'])
+    w.endStream()
   })
 })
